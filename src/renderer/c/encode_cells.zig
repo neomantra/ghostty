@@ -43,13 +43,55 @@ pub const cell_layout = struct {
     pub const FLAG_IS_CURSOR_CELL: u32 = 1 << 14;
 };
 
+// ---------------------------------------------------------------------------
+// Decoration helpers
+// ---------------------------------------------------------------------------
+
+/// Per-row selection column range. Mirrors the TS `updateRowSel` logic.
+const RowSelRange = struct {
+    start_col: i32,
+    end_col: i32, // inclusive
+
+    fn forRow(ctx: *const FrameCtx, row_in_viewport: i32) RowSelRange {
+        if (ctx.selection_present == 0) return .{ .start_col = -1, .end_col = -1 };
+        if (ctx.selection_start_row == ctx.selection_end_row) {
+            if (row_in_viewport == ctx.selection_start_row) {
+                return .{ .start_col = ctx.selection_start_col, .end_col = ctx.selection_end_col };
+            }
+            return .{ .start_col = -1, .end_col = -1 };
+        }
+        if (row_in_viewport == ctx.selection_start_row) {
+            return .{ .start_col = ctx.selection_start_col, .end_col = std.math.maxInt(i32) };
+        }
+        if (row_in_viewport == ctx.selection_end_row) {
+            return .{ .start_col = 0, .end_col = ctx.selection_end_col };
+        }
+        if (row_in_viewport > ctx.selection_start_row and row_in_viewport < ctx.selection_end_row) {
+            return .{ .start_col = 0, .end_col = std.math.maxInt(i32) };
+        }
+        return .{ .start_col = -1, .end_col = -1 };
+    }
+};
+
+/// Returns true if (row, col) falls within the JS-supplied link hover range.
+/// Mirrors the TS `inRange` logic for ctx.hoveredLinkRange.
+fn linkRangeContains(ctx: *const FrameCtx, row: i32, col: i32) bool {
+    if (ctx.link_range_present == 0) return false;
+    const r = ctx.link_range_start_row;
+    const re = ctx.link_range_end_row;
+    const cs = ctx.link_range_start_col;
+    const ce = ctx.link_range_end_col;
+    return (row == r and col >= cs and (row < re or col <= ce)) or
+        (row > r and row < re) or
+        (row == re and col <= ce and (row > r or col >= cs));
+}
+
+// ---------------------------------------------------------------------------
+// Encoder
+// ---------------------------------------------------------------------------
+
 /// Encode one frame. Returns the same status value as out.status:
 /// 0 on success, negative on failure.
-///
-/// Skeleton implementation: iterates the active viewport and writes
-/// fg/bg colors + cell-flag bits. No atlas emission, no decorations
-/// (selection/hover), no special cells (kitty/block) yet — those land
-/// in subsequent tasks of sub-project #2.
 pub fn encodeCellsPhase1(ctx: *const FrameCtx, out: *EncodeOutput) i32 {
     out.* = .{
         .needs_atlas_count = 0,
@@ -117,6 +159,10 @@ pub fn encodeCellsPhase1(ctx: *const FrameCtx, out: *EncodeOutput) i32 {
             row_pin.rowAndCell().row,
         );
 
+        // Compute the selection column range for this row once (hoisted
+        // outside the inner x loop to avoid redundant work per cell).
+        const row_sel = RowSelRange.forRow(ctx, @intCast(y));
+
         var x: u32 = 0;
         while (x < cols) : (x += 1) {
             const i: u32 = (y * cols + x) * cell_layout.CELL_U32S;
@@ -156,6 +202,32 @@ pub fn encodeCellsPhase1(ctx: *const FrameCtx, out: *EncodeOutput) i32 {
             if (style.flags.inverse) flags |= cell_layout.FLAG_INVERSE;
             if (style.flags.faint) flags |= cell_layout.FLAG_FAINT;
             if (style.flags.invisible) flags |= cell_layout.FLAG_INVISIBLE;
+
+            // --- Decoration bits (selection / hover) ---------------------
+
+            // Selection: check if this cell's column falls in the
+            // per-row selection range computed above.
+            const col_i32: i32 = @intCast(x);
+            if (col_i32 >= row_sel.start_col and col_i32 <= row_sel.end_col) {
+                flags |= cell_layout.FLAG_IS_SELECTED;
+            }
+
+            // Hyperlink hover: the cell carries a bool `hyperlink` when it
+            // participates in a hyperlink; resolve the id via the page map
+            // and compare against ctx.hovered_hyperlink_id.
+            if (cell.hyperlink and ctx.hovered_hyperlink_id != 0) {
+                if (page_ptr.lookupHyperlink(&row_cells[x])) |hid| {
+                    if (@as(u32, hid) == ctx.hovered_hyperlink_id) {
+                        flags |= cell_layout.FLAG_IS_HYPERLINK_HOVERED;
+                    }
+                }
+            }
+
+            // Link range hover: a rectangular (possibly multi-row) range
+            // supplied by JS for OSC 8 / regex-matched links.
+            if (linkRangeContains(ctx, @intCast(y), col_i32)) {
+                flags |= cell_layout.FLAG_IS_LINK_RANGE_HOVERED;
+            }
 
             // Resolve fg color. style.fg_color is .none/.palette/.rgb.
             // For palette indices we read the terminal palette; for
@@ -234,7 +306,7 @@ pub fn encodeCellsPhase1(ctx: *const FrameCtx, out: *EncodeOutput) i32 {
             // by JS post-walker in Task 6.
             output[i + 4] = flags;
             // output[i+5..i+7] (special-cell payloads) stay zero —
-            // populated in Tasks 7/8.
+            // populated in Task 8 (block element / kitty placeholder).
 
             // ----- Atlas-needs emission ----------------------------
             // Skip cells with no glyph to render: invisible cells, and
@@ -561,4 +633,64 @@ test "encodeCellsPhase1: 'e' + combining acute emits one entry with 2 codepoints
     // 'e' (1 byte) + combining acute U+0301 (2 bytes: 0xCC 0x81) = 3 bytes.
     try std.testing.expectEqual(@as(u32, 3), e.grapheme_utf8_len);
     try std.testing.expectEqualSlices(u8, "e\xCC\x81", grapheme_buf[0..e.grapheme_utf8_len]);
+}
+
+test "encodeCellsPhase1: selection range sets FLAG_IS_SELECTED on cells inside" {
+    var ht = try HostTestTerminal.init(80, 24);
+    defer ht.deinit();
+    terminal_c.vt_write(ht.wrapper_handle, "hello world", 11);
+
+    var fixture: TestFixture = .{};
+    var ctx = fixture.baseCtx(ht.handle());
+    // Select columns 2..6 of row 0 (l, l, o, space, w).
+    ctx.selection_present = 1;
+    ctx.selection_start_row = 0;
+    ctx.selection_start_col = 2;
+    ctx.selection_end_row = 0;
+    ctx.selection_end_col = 6;
+    var out: EncodeOutput = undefined;
+
+    _ = encodeCellsPhase1(&ctx, &out);
+
+    // Cells 0 and 1 ('h', 'e') not selected.
+    try std.testing.expect((fixture.output_buf[0 * cell_layout.CELL_U32S + 4] & cell_layout.FLAG_IS_SELECTED) == 0);
+    try std.testing.expect((fixture.output_buf[1 * cell_layout.CELL_U32S + 4] & cell_layout.FLAG_IS_SELECTED) == 0);
+    // Cells 2..6 selected.
+    var i: usize = 2;
+    while (i <= 6) : (i += 1) {
+        try std.testing.expect((fixture.output_buf[i * cell_layout.CELL_U32S + 4] & cell_layout.FLAG_IS_SELECTED) != 0);
+    }
+    // Cell 7 ('o' in "world") not selected.
+    try std.testing.expect((fixture.output_buf[7 * cell_layout.CELL_U32S + 4] & cell_layout.FLAG_IS_SELECTED) == 0);
+}
+
+test "encodeCellsPhase1: link range hover sets FLAG_IS_LINK_RANGE_HOVERED" {
+    var ht = try HostTestTerminal.init(80, 24);
+    defer ht.deinit();
+    terminal_c.vt_write(ht.wrapper_handle, "hello world", 11);
+
+    var fixture: TestFixture = .{};
+    var ctx = fixture.baseCtx(ht.handle());
+    // Hover columns 3..7 on row 0.
+    ctx.link_range_present = 1;
+    ctx.link_range_start_row = 0;
+    ctx.link_range_start_col = 3;
+    ctx.link_range_end_row = 0;
+    ctx.link_range_end_col = 7;
+    var out: EncodeOutput = undefined;
+
+    _ = encodeCellsPhase1(&ctx, &out);
+
+    // Cells 0..2 not in range.
+    var j: usize = 0;
+    while (j <= 2) : (j += 1) {
+        try std.testing.expect((fixture.output_buf[j * cell_layout.CELL_U32S + 4] & cell_layout.FLAG_IS_LINK_RANGE_HOVERED) == 0);
+    }
+    // Cells 3..7 in range.
+    j = 3;
+    while (j <= 7) : (j += 1) {
+        try std.testing.expect((fixture.output_buf[j * cell_layout.CELL_U32S + 4] & cell_layout.FLAG_IS_LINK_RANGE_HOVERED) != 0);
+    }
+    // Cell 8 not in range.
+    try std.testing.expect((fixture.output_buf[8 * cell_layout.CELL_U32S + 4] & cell_layout.FLAG_IS_LINK_RANGE_HOVERED) == 0);
 }

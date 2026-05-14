@@ -325,5 +325,14 @@ test {
     @import("std").testing.refAllDecls(input);
     if (comptime terminal.options.c_abi) {
         _ = terminal.c_api;
+        // ghostty-web: also discover tests in renderer/c/*.zig (encoder
+        // skeleton, frame ctx structs). We reference encode_cells.zig
+        // (and frame_ctx.zig) directly rather than going through
+        // renderer.c_api / renderer/c/main.zig — the latter touches
+        // ../cell.zig which transitively imports the full renderer +
+        // font modules (Metal/OpenGL/font assets, none available in a
+        // vt-only test target).
+        _ = @import("renderer/c/encode_cells.zig");
+        _ = @import("renderer/c/frame_ctx.zig");
     }
 }

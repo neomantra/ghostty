@@ -290,6 +290,16 @@ pub fn vt_write(
     wrapper.stream.nextSlice(ptr[0..len]);
 }
 
+/// ghostty-web: accessor for the inner `Terminal` pointer from a C
+/// `TerminalWrapper` handle. Used by the renderer C ABI
+/// (renderer/c/encode_cells.zig) to walk the active screen without
+/// exposing `TerminalWrapper`'s internals. Returns null when the
+/// handle is null.
+pub inline fn terminalPtr(terminal_: Terminal) ?*ZigTerminal {
+    const wrapper = terminal_ orelse return null;
+    return wrapper.terminal;
+}
+
 /// C: GhosttyTerminalOption
 pub const Option = enum(c_int) {
     userdata = 0,

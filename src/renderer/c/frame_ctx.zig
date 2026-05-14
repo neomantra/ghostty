@@ -4,12 +4,18 @@
 //! and the JS-side wrapper in lib/renderer-wasm-encode.ts. The layouts
 //! must match exactly — JS uses a DataView with byte offsets derived
 //! from these field orderings.
+//!
+//! Pointer-typed fields (terminal_handle, output_buf_ptr, etc.) use
+//! `usize` so the same struct compiles for both wasm32 (where usize is
+//! u32) and the 64-bit host used by Zig unit tests. On WASM the layout
+//! matches what the JS side writes; on the host the struct grows but
+//! never crosses an ABI boundary, so the discrepancy is harmless.
 
 /// Per-frame input written by JS into linear memory and read by
-/// renderer_encode_cells_phase1. Fields are u32 except for signed
-/// row/col coords that may be -1 (sentinel for "not set").
+/// renderer_encode_cells_phase1. Most fields are u32; pointer-typed
+/// fields are `usize` for wasm32/host-native portability.
 pub const FrameCtx = extern struct {
-    terminal_handle: u32,
+    terminal_handle: usize,
     viewport_y: u32,
     scrollback_len: u32,
 
@@ -45,22 +51,22 @@ pub const FrameCtx = extern struct {
     max_kitty_images: u32,
 
     /// Output: packed cell bytes. Sized for rows*cols*CELL_BYTES.
-    output_buf_ptr: u32,
+    output_buf_ptr: usize,
     output_buf_len: u32,
 
     /// Output: NeedsAtlasEntry array. Capacity = rows*cols.
-    needs_atlas_ptr: u32,
+    needs_atlas_ptr: usize,
     needs_atlas_capacity: u32,
 
     /// Output: grapheme UTF-8 scratch arena. Capacity should be
     /// rows*cols*32 bytes (generous upper bound).
-    grapheme_scratch_ptr: u32,
+    grapheme_scratch_ptr: usize,
     grapheme_scratch_len: u32,
 
     /// Input: JS-prepared imageId -> (idx in used_kitty_image_ids) map,
     /// for kitty placeholder cells. Format: pairs of (imageId, idx) u32,
     /// terminated by imageId==0. Read but not written by WASM.
-    kitty_image_table_ptr: u32,
+    kitty_image_table_ptr: usize,
     kitty_image_table_len: u32,
 };
 

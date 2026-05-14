@@ -552,7 +552,7 @@ const IncompletePlacement = struct {
 };
 
 /// Get the row/col index for a diacritic codepoint. These are 0-indexed.
-fn getIndex(cp: u21) ?u32 {
+pub fn getIndex(cp: u21) ?u32 {
     const idx = std.sort.binarySearch(u21, diacritics, cp, (struct {
         fn compare(context: u21, item: u21) std.math.Order {
             return std.math.order(context, item);

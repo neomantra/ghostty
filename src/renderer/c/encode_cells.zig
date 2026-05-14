@@ -10,10 +10,42 @@ const builtin = @import("builtin");
 const frame_ctx = @import("frame_ctx.zig");
 const terminal = @import("../../terminal/main.zig");
 const terminal_c = @import("../../terminal/c/terminal.zig");
+const kitty_unicode = @import("../../terminal/kitty/graphics_unicode.zig");
 
 pub const FrameCtx = frame_ctx.FrameCtx;
 pub const NeedsAtlasEntry = frame_ctx.NeedsAtlasEntry;
 pub const EncodeOutput = frame_ctx.EncodeOutput;
+
+/// Kitty Graphics protocol Unicode placeholder codepoint.
+const KITTY_PLACEHOLDER: u21 = 0x10EEEE;
+
+/// Entry in the JS-supplied kitty image table. Layout MUST match the
+/// TS-side writer (lib/renderer-wasm-encode.ts in Task 10). Four u32s,
+/// terminated by image_id == 0.
+const KittyImageTableEntry = extern struct {
+    image_id: u32,
+    idx: u32,
+    grid_cols: u32,
+    grid_rows: u32,
+};
+
+/// Linear-search the JS-supplied kitty image table for `image_id`.
+/// Returns null if not present, the table is empty, or `image_id` is 0
+/// (0 is the table terminator and so is not a valid lookup target).
+fn kittyImageTableLookup(ctx: *const FrameCtx, image_id: u32) ?KittyImageTableEntry {
+    if (image_id == 0) return null;
+    if (ctx.kitty_image_table_len == 0) return null;
+    if (ctx.kitty_image_table_ptr == 0) return null;
+    const table: [*]const KittyImageTableEntry = @ptrFromInt(ctx.kitty_image_table_ptr);
+    const count: u32 = ctx.kitty_image_table_len / @sizeOf(KittyImageTableEntry);
+    var k: u32 = 0;
+    while (k < count) : (k += 1) {
+        const entry = table[k];
+        if (entry.image_id == 0) return null;
+        if (entry.image_id == image_id) return entry;
+    }
+    return null;
+}
 
 // Cell-layout constants. The canonical definitions live in
 // `renderer/cell.zig` (referenced by the C-ABI surface in
@@ -304,18 +336,89 @@ pub fn encodeCellsPhase1(ctx: *const FrameCtx, out: *EncodeOutput) i32 {
             output[i + 1] = bg_packed;
             // output[i+2..i+3] (atlas slot UV/wh) stay zero — filled
             // by JS post-walker in Task 6.
+            // output[i+5..i+7] (special-cell payloads) stay zero unless
+            // the block-element or kitty-placeholder paths below run.
+
+            // ----- Special-cell paths (block element / kitty) ------
+            const cp: u21 = cell.codepoint();
+
+            // Block-element shader path: codepoints U+2580..U+259F
+            // render directly in the cell shader (no glyph atlas).
+            // Gated on ctx.block_element_enabled. Block-element cells
+            // with combining marks fall back to the atlas path.
+            if (ctx.block_element_enabled != 0 and
+                cp >= 0x2580 and cp <= 0x259f and
+                !cell.hasGrapheme())
+            {
+                flags |= cell_layout.FLAG_IS_BLOCK_ELEMENT;
+                output[i + 5] = @as(u32, cp) - 0x2580;
+            }
+
+            // Kitty Unicode placeholder path: codepoint U+10EEEE. The
+            // row/col/image-id-msb are encoded as combining-diacritic
+            // extras on the cell's grapheme. If the imageId resolves
+            // against the JS-supplied kitty_image_table, write the
+            // placement encoding and flag the cell.
+            if (ctx.kitty_enabled != 0 and cp == KITTY_PLACEHOLDER and cell.hasGrapheme()) {
+                if (page_ptr.lookupGrapheme(&row_cells[x])) |extras| {
+                    if (extras.len >= 2) {
+                        const row_d_opt = kitty_unicode.getIndex(extras[0]);
+                        const col_d_opt = kitty_unicode.getIndex(extras[1]);
+                        if (row_d_opt != null and col_d_opt != null) {
+                            const row_d: u32 = row_d_opt.?;
+                            const col_d: u32 = col_d_opt.?;
+                            // Compose imageId from fg rgb (+ optional msb
+                            // from 3rd diacritic). fg_r/g/b were already
+                            // resolved above.
+                            const fg_rgb: u32 =
+                                (@as(u32, fg_r) << 16) |
+                                (@as(u32, fg_g) << 8) |
+                                @as(u32, fg_b);
+                            var image_id: u32 = fg_rgb;
+                            if (extras.len >= 3) {
+                                if (kitty_unicode.getIndex(extras[2])) |msb| {
+                                    image_id = (msb << 24) | fg_rgb;
+                                }
+                            }
+                            if (kittyImageTableLookup(ctx, image_id)) |entry| {
+                                flags |= cell_layout.FLAG_IS_KITTY_PLACEHOLDER;
+                                output[i + 5] =
+                                    (col_d & 0xffff) | ((row_d & 0xffff) << 16);
+                                output[i + 6] = entry.idx;
+                                output[i + 7] =
+                                    (entry.grid_cols & 0xffff) |
+                                    ((entry.grid_rows & 0xffff) << 16);
+                                // Track the imageId in used_kitty_image_ids
+                                // if not already present (capped at 16).
+                                var already_seen = false;
+                                var s: u32 = 0;
+                                while (s < out.used_kitty_image_count) : (s += 1) {
+                                    if (out.used_kitty_image_ids[s] == image_id) {
+                                        already_seen = true;
+                                        break;
+                                    }
+                                }
+                                if (!already_seen and out.used_kitty_image_count < 16) {
+                                    out.used_kitty_image_ids[out.used_kitty_image_count] = image_id;
+                                    out.used_kitty_image_count += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             output[i + 4] = flags;
-            // output[i+5..i+7] (special-cell payloads) stay zero —
-            // populated in Task 8 (block element / kitty placeholder).
 
             // ----- Atlas-needs emission ----------------------------
-            // Skip cells with no glyph to render: invisible cells, and
-            // bg-only cells (content_tag of bg_color_*). FLAG_IS_BLOCK_ELEMENT
-            // and FLAG_IS_KITTY_PLACEHOLDER will also gate here when added in
-            // Task 8; for now they're never set.
-            const cp: u21 = cell.codepoint();
+            // Skip cells with no glyph to render: invisible cells, cells
+            // with no codepoint, block-element cells (rendered in-shader),
+            // and kitty-placeholder cells (rendered by the kitty image
+            // pipeline).
             const skip_atlas =
-                (flags & cell_layout.FLAG_INVISIBLE) != 0 or
+                (flags & (cell_layout.FLAG_INVISIBLE |
+                    cell_layout.FLAG_IS_BLOCK_ELEMENT |
+                    cell_layout.FLAG_IS_KITTY_PLACEHOLDER)) != 0 or
                 cp == 0;
             if (skip_atlas) continue;
 
@@ -693,4 +796,161 @@ test "encodeCellsPhase1: link range hover sets FLAG_IS_LINK_RANGE_HOVERED" {
     }
     // Cell 8 not in range.
     try std.testing.expect((fixture.output_buf[8 * cell_layout.CELL_U32S + 4] & cell_layout.FLAG_IS_LINK_RANGE_HOVERED) == 0);
+}
+
+test "encodeCellsPhase1: block-element codepoint sets flag and writes index, skips atlas" {
+    var ht = try HostTestTerminal.init(80, 24);
+    defer ht.deinit();
+    // U+2580 UPPER HALF BLOCK (UTF-8: e2 96 80) — first block element.
+    terminal_c.vt_write(ht.wrapper_handle, "\xe2\x96\x80", 3);
+
+    var fixture: TestFixture = .{};
+    var ctx = fixture.baseCtx(ht.handle());
+    ctx.block_element_enabled = 1;
+    var out: EncodeOutput = undefined;
+
+    _ = encodeCellsPhase1(&ctx, &out);
+
+    const flags = fixture.output_buf[4];
+    try std.testing.expect((flags & cell_layout.FLAG_IS_BLOCK_ELEMENT) != 0);
+    // Index into the 32-cell block-element table: 0x2580 - 0x2580 = 0.
+    try std.testing.expectEqual(@as(u32, 0), fixture.output_buf[5]);
+    // Block-element cells are NOT emitted to the atlas needs list — the
+    // shader renders them directly.
+    try std.testing.expectEqual(@as(u32, 0), out.needs_atlas_count);
+}
+
+test "encodeCellsPhase1: block-element disabled falls back to atlas path" {
+    var ht = try HostTestTerminal.init(80, 24);
+    defer ht.deinit();
+    terminal_c.vt_write(ht.wrapper_handle, "\xe2\x96\x80", 3);
+
+    var fixture: TestFixture = .{};
+    var ctx = fixture.baseCtx(ht.handle());
+    ctx.block_element_enabled = 0; // disabled
+    var out: EncodeOutput = undefined;
+
+    _ = encodeCellsPhase1(&ctx, &out);
+
+    const flags = fixture.output_buf[4];
+    try std.testing.expect((flags & cell_layout.FLAG_IS_BLOCK_ELEMENT) == 0);
+    // Glyph should be requested from the atlas (1 entry for cell 0).
+    try std.testing.expectEqual(@as(u32, 1), out.needs_atlas_count);
+}
+
+test "encodeCellsPhase1: block-element range upper bound U+259F" {
+    var ht = try HostTestTerminal.init(80, 24);
+    defer ht.deinit();
+    // U+259F QUADRANT UPPER LEFT AND LOWER LEFT AND LOWER RIGHT (UTF-8: e2 96 9f).
+    terminal_c.vt_write(ht.wrapper_handle, "\xe2\x96\x9f", 3);
+
+    var fixture: TestFixture = .{};
+    var ctx = fixture.baseCtx(ht.handle());
+    ctx.block_element_enabled = 1;
+    var out: EncodeOutput = undefined;
+
+    _ = encodeCellsPhase1(&ctx, &out);
+
+    const flags = fixture.output_buf[4];
+    try std.testing.expect((flags & cell_layout.FLAG_IS_BLOCK_ELEMENT) != 0);
+    // 0x259f - 0x2580 = 0x1f = 31.
+    try std.testing.expectEqual(@as(u32, 31), fixture.output_buf[5]);
+    try std.testing.expectEqual(@as(u32, 0), out.needs_atlas_count);
+}
+
+test "encodeCellsPhase1: non-block codepoint just below range goes to atlas" {
+    var ht = try HostTestTerminal.init(80, 24);
+    defer ht.deinit();
+    // U+257F (just below U+2580) — UTF-8: e2 95 bf.
+    terminal_c.vt_write(ht.wrapper_handle, "\xe2\x95\xbf", 3);
+
+    var fixture: TestFixture = .{};
+    var ctx = fixture.baseCtx(ht.handle());
+    ctx.block_element_enabled = 1;
+    var out: EncodeOutput = undefined;
+
+    _ = encodeCellsPhase1(&ctx, &out);
+
+    const flags = fixture.output_buf[4];
+    try std.testing.expect((flags & cell_layout.FLAG_IS_BLOCK_ELEMENT) == 0);
+    try std.testing.expectEqual(@as(u32, 1), out.needs_atlas_count);
+}
+
+test "encodeCellsPhase1: kitty placeholder with valid image table entry" {
+    var ht = try HostTestTerminal.init(80, 24);
+    defer ht.deinit();
+    // Enable grapheme-cluster mode so the diacritics ride on the
+    // placeholder cell as grapheme extras (mirroring the unit tests
+    // in graphics_unicode.zig).
+    ht.inner.modes.set(.grapheme_cluster, true);
+    // Use a direct RGB fg color — the encoder composes imageId from
+    // the resolved (r,g,b) bytes, so a direct RGB lets us pick a
+    // predictable imageId. r=0x12, g=0x34, b=0x56 → imageId 0x123456.
+    try ht.inner.setAttribute(.{ .direct_color_fg = .{
+        .r = 0x12,
+        .g = 0x34,
+        .b = 0x56,
+    } });
+    try ht.inner.printString("\u{10EEEE}\u{0305}\u{0305}");
+
+    // Build a kitty image table with one entry: imageId=0x123456, idx=7,
+    // gridCols=4, gridRows=2. Followed by a zero-imageId terminator.
+    var table: [2]KittyImageTableEntry = .{
+        .{ .image_id = 0x123456, .idx = 7, .grid_cols = 4, .grid_rows = 2 },
+        .{ .image_id = 0, .idx = 0, .grid_cols = 0, .grid_rows = 0 },
+    };
+
+    var fixture: TestFixture = .{};
+    var ctx = fixture.baseCtx(ht.handle());
+    ctx.kitty_enabled = 1;
+    ctx.kitty_image_table_ptr = @intFromPtr(&table);
+    ctx.kitty_image_table_len = @sizeOf(@TypeOf(table));
+    var out: EncodeOutput = undefined;
+
+    _ = encodeCellsPhase1(&ctx, &out);
+
+    const flags = fixture.output_buf[4];
+    try std.testing.expect((flags & cell_layout.FLAG_IS_KITTY_PLACEHOLDER) != 0);
+    // row_d=0, col_d=0 (both U+0305 = index 0).
+    try std.testing.expectEqual(@as(u32, 0), fixture.output_buf[5]);
+    // idx written to output[i+6].
+    try std.testing.expectEqual(@as(u32, 7), fixture.output_buf[6]);
+    // grid_cols=4, grid_rows=2 packed.
+    try std.testing.expectEqual(@as(u32, 4 | (2 << 16)), fixture.output_buf[7]);
+    // Image id tracked in used_kitty_image_ids.
+    try std.testing.expectEqual(@as(u32, 1), out.used_kitty_image_count);
+    try std.testing.expectEqual(@as(u32, 0x123456), out.used_kitty_image_ids[0]);
+    // Atlas emission is skipped for kitty placeholder cells.
+    try std.testing.expectEqual(@as(u32, 0), out.needs_atlas_count);
+}
+
+test "encodeCellsPhase1: kitty placeholder with no table match doesn't set flag" {
+    var ht = try HostTestTerminal.init(80, 24);
+    defer ht.deinit();
+    ht.inner.modes.set(.grapheme_cluster, true);
+    // Different RGB so imageId 0xAABBCC won't match table entry 0x123456.
+    try ht.inner.setAttribute(.{ .direct_color_fg = .{
+        .r = 0xAA,
+        .g = 0xBB,
+        .b = 0xCC,
+    } });
+    try ht.inner.printString("\u{10EEEE}\u{0305}\u{0305}");
+
+    var table: [2]KittyImageTableEntry = .{
+        .{ .image_id = 0x123456, .idx = 7, .grid_cols = 4, .grid_rows = 2 },
+        .{ .image_id = 0, .idx = 0, .grid_cols = 0, .grid_rows = 0 },
+    };
+
+    var fixture: TestFixture = .{};
+    var ctx = fixture.baseCtx(ht.handle());
+    ctx.kitty_enabled = 1;
+    ctx.kitty_image_table_ptr = @intFromPtr(&table);
+    ctx.kitty_image_table_len = @sizeOf(@TypeOf(table));
+    var out: EncodeOutput = undefined;
+
+    _ = encodeCellsPhase1(&ctx, &out);
+
+    const flags = fixture.output_buf[4];
+    try std.testing.expect((flags & cell_layout.FLAG_IS_KITTY_PLACEHOLDER) == 0);
+    try std.testing.expectEqual(@as(u32, 0), out.used_kitty_image_count);
 }

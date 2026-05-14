@@ -86,3 +86,28 @@ export fn renderer_flag_use_theme_bg() u32 {
 export fn renderer_flag_is_cursor_cell() u32 {
     return cell.FLAG_IS_CURSOR_CELL;
 }
+
+// -------------------------------------------------------------------------
+// Cell encoding (sub-project #2)
+// -------------------------------------------------------------------------
+
+const encode = @import("encode_cells.zig");
+const frame_ctx_mod = @import("frame_ctx.zig");
+
+export fn renderer_frame_ctx_size() u32 {
+    return @sizeOf(frame_ctx_mod.FrameCtx);
+}
+
+export fn renderer_needs_atlas_entry_size() u32 {
+    return @sizeOf(frame_ctx_mod.NeedsAtlasEntry);
+}
+
+export fn renderer_encode_output_size() u32 {
+    return @sizeOf(frame_ctx_mod.EncodeOutput);
+}
+
+export fn renderer_encode_cells_phase1(ctx_ptr: u32, out_ptr: u32) i32 {
+    const ctx: *const frame_ctx_mod.FrameCtx = @ptrFromInt(ctx_ptr);
+    const out: *frame_ctx_mod.EncodeOutput = @ptrFromInt(out_ptr);
+    return encode.encodeCellsPhase1(ctx, out);
+}

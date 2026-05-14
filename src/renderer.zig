@@ -33,7 +33,7 @@ pub const Padding = size.Padding;
 pub const cursorStyle = cursor.style;
 pub const lib = @import("lib/main.zig");
 
-const options = @import("terminal_options");
+pub const options = @import("terminal_options");
 
 /// C ABI surface for the renderer module. Compiled only when c_abi is set
 /// (i.e., when building the C/WASM library). On native builds this resolves

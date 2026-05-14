@@ -91,6 +91,13 @@ pub fn encodeCellsPhase1(ctx: *const FrameCtx, out: *EncodeOutput) i32 {
     const default_empty_flags: u32 =
         cell_layout.FLAG_USE_THEME_FG | cell_layout.FLAG_USE_THEME_BG;
 
+    // Running offset into the JS-owned grapheme scratch arena. We hand
+    // out [start..start+len) slices to NeedsAtlasEntry records as we
+    // encode glyph-bearing cells. Resets to 0 every encode call.
+    var grapheme_scratch_used: u32 = 0;
+    const grapheme_buf: [*]u8 = @ptrFromInt(ctx.grapheme_scratch_ptr);
+    const needs_atlas_entries: [*]NeedsAtlasEntry = @ptrFromInt(ctx.needs_atlas_ptr);
+
     // Walk active viewport rows top-to-bottom.
     var row_it = screen.pages.rowIterator(
         .right_down,
@@ -224,6 +231,93 @@ pub fn encodeCellsPhase1(ctx: *const FrameCtx, out: *EncodeOutput) i32 {
             output[i + 4] = flags;
             // output[i+5..i+7] (special-cell payloads) stay zero —
             // populated in Tasks 7/8.
+
+            // ----- Atlas-needs emission ----------------------------
+            // Skip cells with no glyph to render: invisible cells, and
+            // bg-only cells (content_tag of bg_color_*). FLAG_IS_BLOCK_ELEMENT
+            // and FLAG_IS_KITTY_PLACEHOLDER will also gate here when added in
+            // Task 8; for now they're never set.
+            const cp: u21 = cell.codepoint();
+            const skip_atlas =
+                (flags & cell_layout.FLAG_INVISIBLE) != 0 or
+                cp == 0;
+            if (skip_atlas) continue;
+
+            if (out.needs_atlas_count >= ctx.needs_atlas_capacity) {
+                out.status = -2;
+                return -2;
+            }
+
+            // Build grapheme UTF-8 into the scratch arena, base
+            // codepoint first then any combining-mark extras.
+            const grapheme_start: usize = ctx.grapheme_scratch_ptr + grapheme_scratch_used;
+            var write_len: u32 = 0;
+
+            var utf8_buf: [4]u8 = undefined;
+            const base_len: u32 = blk: {
+                const n = std.unicode.utf8Encode(cp, &utf8_buf) catch {
+                    // Invalid codepoint — should never happen because
+                    // ghostty validates codepoints on the way in. Skip
+                    // the atlas entry but keep the cell's color/flag
+                    // bytes intact.
+                    @branchHint(.cold);
+                    break :blk 0;
+                };
+                break :blk @intCast(n);
+            };
+            if (base_len == 0) continue;
+            if (grapheme_scratch_used + base_len > ctx.grapheme_scratch_len) {
+                out.status = -3;
+                return -3;
+            }
+            @memcpy(
+                grapheme_buf[grapheme_scratch_used .. grapheme_scratch_used + base_len],
+                utf8_buf[0..base_len],
+            );
+            grapheme_scratch_used += base_len;
+            write_len += base_len;
+
+            // Grapheme extras (combining marks). lookupGrapheme returns
+            // the EXTRA codepoints only — the base is not included.
+            if (cell.hasGrapheme()) {
+                if (page_ptr.lookupGrapheme(&row_cells[x])) |extras| {
+                    for (extras) |extra_cp| {
+                        const extra_len: u32 = blk: {
+                            const n = std.unicode.utf8Encode(extra_cp, &utf8_buf) catch {
+                                @branchHint(.cold);
+                                break :blk 0;
+                            };
+                            break :blk @intCast(n);
+                        };
+                        if (extra_len == 0) continue;
+                        if (grapheme_scratch_used + extra_len > ctx.grapheme_scratch_len) {
+                            out.status = -3;
+                            return -3;
+                        }
+                        @memcpy(
+                            grapheme_buf[grapheme_scratch_used .. grapheme_scratch_used + extra_len],
+                            utf8_buf[0..extra_len],
+                        );
+                        grapheme_scratch_used += extra_len;
+                        write_len += extra_len;
+                    }
+                }
+            }
+
+            const style_bits: u32 =
+                (if (flags & cell_layout.FLAG_BOLD != 0) @as(u32, 1) else 0) |
+                (if (flags & cell_layout.FLAG_ITALIC != 0) @as(u32, 2) else 0);
+
+            const width_in_cells: u32 = if (cell.wide == .wide) 2 else 1;
+
+            needs_atlas_entries[out.needs_atlas_count] = .{
+                .cell_offset = i,
+                .grapheme_utf8_ptr = grapheme_start,
+                .grapheme_utf8_len = write_len,
+                .style_bits = style_bits,
+                .width_in_cells = width_in_cells,
+            };
+            out.needs_atlas_count += 1;
         }
     }
 
@@ -376,4 +470,86 @@ test "encodeCellsPhase1: single ASCII bold cell encodes flags" {
     const second_flags = fixture.output_buf[cell_layout.CELL_U32S + 4];
     const expected_empty = cell_layout.FLAG_USE_THEME_FG | cell_layout.FLAG_USE_THEME_BG;
     try std.testing.expectEqual(expected_empty, second_flags);
+}
+
+test "encodeCellsPhase1: single ASCII A emits one NeedsAtlasEntry with 'A'" {
+    var term = try HostTestTerminal.init(80, 24);
+    defer term.deinit();
+
+    const seq = "A";
+    terminal_c.vt_write(term.wrapper_handle, seq.ptr, seq.len);
+
+    var fixture: TestFixture = .{};
+    const ctx = fixture.baseCtx(term.handle());
+    var out: EncodeOutput = undefined;
+
+    _ = encodeCellsPhase1(&ctx, &out);
+
+    try std.testing.expectEqual(@as(u32, 1), out.needs_atlas_count);
+    const e = fixture.needs_atlas[0];
+    try std.testing.expectEqual(@as(u32, 0), e.cell_offset);
+    try std.testing.expectEqual(@as(u32, 1), e.width_in_cells);
+    try std.testing.expectEqual(@as(u32, 0), e.style_bits);
+
+    // Grapheme bytes should be "A".
+    const grapheme_buf: [*]const u8 = @ptrFromInt(e.grapheme_utf8_ptr);
+    try std.testing.expectEqualSlices(u8, "A", grapheme_buf[0..e.grapheme_utf8_len]);
+}
+
+test "encodeCellsPhase1: bold A sets style_bits=1" {
+    var term = try HostTestTerminal.init(80, 24);
+    defer term.deinit();
+
+    const seq = "\x1b[1mA\x1b[0m";
+    terminal_c.vt_write(term.wrapper_handle, seq.ptr, seq.len);
+
+    var fixture: TestFixture = .{};
+    const ctx = fixture.baseCtx(term.handle());
+    var out: EncodeOutput = undefined;
+
+    _ = encodeCellsPhase1(&ctx, &out);
+
+    try std.testing.expectEqual(@as(u32, 1), out.needs_atlas_count);
+    try std.testing.expectEqual(@as(u32, 1), fixture.needs_atlas[0].style_bits); // bold
+}
+
+test "encodeCellsPhase1: CJK wide glyph emits one entry width=2" {
+    var term = try HostTestTerminal.init(80, 24);
+    defer term.deinit();
+
+    // U+6F22 "漢" — wide CJK ideograph (3 bytes UTF-8).
+    const seq = "\xE6\xBC\xA2";
+    terminal_c.vt_write(term.wrapper_handle, seq.ptr, seq.len);
+
+    var fixture: TestFixture = .{};
+    const ctx = fixture.baseCtx(term.handle());
+    var out: EncodeOutput = undefined;
+
+    _ = encodeCellsPhase1(&ctx, &out);
+
+    try std.testing.expectEqual(@as(u32, 1), out.needs_atlas_count);
+    try std.testing.expectEqual(@as(u32, 2), fixture.needs_atlas[0].width_in_cells);
+    try std.testing.expectEqual(@as(u32, 0), fixture.needs_atlas[0].cell_offset);
+}
+
+test "encodeCellsPhase1: 'e' + combining acute emits one entry with 2 codepoints" {
+    var term = try HostTestTerminal.init(80, 24);
+    defer term.deinit();
+
+    // 'e' + U+0301 combining acute (0xCC 0x81 in UTF-8) → é.
+    const seq = "e\xCC\x81";
+    terminal_c.vt_write(term.wrapper_handle, seq.ptr, seq.len);
+
+    var fixture: TestFixture = .{};
+    const ctx = fixture.baseCtx(term.handle());
+    var out: EncodeOutput = undefined;
+
+    _ = encodeCellsPhase1(&ctx, &out);
+
+    try std.testing.expectEqual(@as(u32, 1), out.needs_atlas_count);
+    const e = fixture.needs_atlas[0];
+    const grapheme_buf: [*]const u8 = @ptrFromInt(e.grapheme_utf8_ptr);
+    // 'e' (1 byte) + combining acute U+0301 (2 bytes: 0xCC 0x81) = 3 bytes.
+    try std.testing.expectEqual(@as(u32, 3), e.grapheme_utf8_len);
+    try std.testing.expectEqualSlices(u8, "e\xCC\x81", grapheme_buf[0..e.grapheme_utf8_len]);
 }

@@ -77,8 +77,11 @@ pub const NeedsAtlasEntry = extern struct {
     /// Offset into FrameCtx.output_buf in u32 units (i.e., index of the
     /// first u32 of this cell's 8-u32 record).
     cell_offset: u32,
-    /// Pointer into the grapheme_scratch arena.
-    grapheme_utf8_ptr: u32,
+    /// Pointer into the grapheme_scratch arena. usize (u32 on wasm32,
+    /// u64 on 64-bit host tests) for the same reason FrameCtx's
+    /// pointer fields are usize — Zig host tests need real pointers,
+    /// WASM ABI stays unchanged.
+    grapheme_utf8_ptr: usize,
     grapheme_utf8_len: u32,
     /// bit 0: bold, bit 1: italic.
     style_bits: u32,

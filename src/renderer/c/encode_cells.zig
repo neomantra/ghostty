@@ -171,10 +171,10 @@ pub fn encodeCellsPhase1(ctx: *const FrameCtx, out: *EncodeOutput) i32 {
 
             // Resolve bg color. Cells with a bg_color_palette or
             // bg_color_rgb content_tag carry the color inline (these
-            // are "bg-only" cells that bypass the style map). They
-            // are filtered out above by isEmpty=false but with no
-            // codepoint, so we still need to handle them here for
-            // the color payload.
+            // are "bg-only" cells that bypass the style map): they
+            // have no codepoint but isEmpty() returns false, so they
+            // reach this branch and we read the color from content_tag
+            // directly rather than via the style map.
             var bg_r: u8 = 0;
             var bg_g: u8 = 0;
             var bg_b: u8 = 0;

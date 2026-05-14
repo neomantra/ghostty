@@ -8,6 +8,39 @@ const shaderpkg = renderer.Renderer.API.shaders;
 const ArrayListCollection = @import("../datastruct/array_list_collection.zig").ArrayListCollection;
 const symbols = @import("../unicode/symbols_table.zig").table;
 
+// -----------------------------------------------------------------------------
+// ghostty-web: cell-layout constants for the GPU vertex/cell buffer.
+//
+// These are deliberately backend-independent (do not reference shaderpkg)
+// so the renderer-side WASM ABI can expose them without forcing a chosen
+// renderer backend. The TS side mirrors these in lib/renderer-core.ts;
+// a load-time assertion in ghostty-web's Ghostty.load detects drift.
+// -----------------------------------------------------------------------------
+
+/// Bytes per cell in the packed Uint32Array consumed by GPU shaders.
+pub const CELL_BYTES: u32 = 32;
+
+/// u32s per cell — CELL_BYTES / 4. Used for indexing the packed buffer.
+pub const CELL_U32S: u32 = CELL_BYTES / 4;
+
+// Cell flag bits. Must match the FLAG_* constants in
+// lib/renderer-core.ts and any shader source consuming them.
+pub const FLAG_BOLD: u32 = 1 << 0;
+pub const FLAG_ITALIC: u32 = 1 << 1;
+pub const FLAG_UNDERLINE: u32 = 1 << 2;
+pub const FLAG_STRIKETHROUGH: u32 = 1 << 3;
+pub const FLAG_INVERSE: u32 = 1 << 4;
+pub const FLAG_FAINT: u32 = 1 << 5;
+pub const FLAG_INVISIBLE: u32 = 1 << 6;
+pub const FLAG_IS_SELECTED: u32 = 1 << 7;
+pub const FLAG_IS_HYPERLINK_HOVERED: u32 = 1 << 8;
+pub const FLAG_IS_LINK_RANGE_HOVERED: u32 = 1 << 9;
+pub const FLAG_IS_BLOCK_ELEMENT: u32 = 1 << 10;
+pub const FLAG_IS_KITTY_PLACEHOLDER: u32 = 1 << 11;
+pub const FLAG_USE_THEME_FG: u32 = 1 << 12;
+pub const FLAG_USE_THEME_BG: u32 = 1 << 13;
+pub const FLAG_IS_CURSOR_CELL: u32 = 1 << 14;
+
 /// The possible cell content keys that exist.
 pub const Key = enum {
     bg,

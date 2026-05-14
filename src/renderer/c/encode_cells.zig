@@ -95,6 +95,10 @@ pub fn encodeCellsPhase1(ctx: *const FrameCtx, out: *EncodeOutput) i32 {
     // out [start..start+len) slices to NeedsAtlasEntry records as we
     // encode glyph-bearing cells. Resets to 0 every encode call.
     var grapheme_scratch_used: u32 = 0;
+    // Cast the JS-owned scratch + entry pointers once for readability —
+    // ctx.{grapheme_scratch_ptr,needs_atlas_ptr} are stable across the
+    // whole encode call, so threading these through the inner loop
+    // reduces @ptrFromInt noise (not a perf win — pointer casts are free).
     const grapheme_buf: [*]u8 = @ptrFromInt(ctx.grapheme_scratch_ptr);
     const needs_atlas_entries: [*]NeedsAtlasEntry = @ptrFromInt(ctx.needs_atlas_ptr);
 
@@ -257,9 +261,14 @@ pub fn encodeCellsPhase1(ctx: *const FrameCtx, out: *EncodeOutput) i32 {
             const base_len: u32 = blk: {
                 const n = std.unicode.utf8Encode(cp, &utf8_buf) catch {
                     // Invalid codepoint — should never happen because
-                    // ghostty validates codepoints on the way in. Skip
-                    // the atlas entry but keep the cell's color/flag
-                    // bytes intact.
+                    // ghostty validates codepoints when ingesting VT
+                    // streams (terminal/stream.zig + parser.zig refuse
+                    // surrogate halves and >U+10FFFF). If it ever does,
+                    // silently dropping the atlas entry means this one
+                    // cell renders without a glyph but the rest of the
+                    // frame is fine — preferable to aborting the whole
+                    // encode. Color/flag bytes for this cell are still
+                    // written above so the bg shows correctly.
                     @branchHint(.cold);
                     break :blk 0;
                 };

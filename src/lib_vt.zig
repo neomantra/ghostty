@@ -18,6 +18,7 @@ const builtin = @import("builtin");
 // parts of `terminal` that are not ready for public consumption
 // or are too Ghostty-internal.
 const terminal = @import("terminal/main.zig");
+const renderer = @import("renderer.zig");
 
 /// System interface for the terminal package.
 ///
@@ -266,6 +267,15 @@ comptime {
         @export(&c.type_json, .{ .name = "ghostty_type_json" });
         @export(&c.alloc_alloc, .{ .name = "ghostty_alloc" });
         @export(&c.alloc_free, .{ .name = "ghostty_free" });
+
+        // Force-reference the renderer's C ABI surface so its `export fn`
+        // declarations are reachable from the compile root and emitted into
+        // the artifact. Gated by renderer.options.c_abi (which mirrors
+        // terminal.options.c_abi for the C/WASM library build); on native
+        // module builds this resolves to `void` and is a no-op.
+        if (renderer.options.c_abi) {
+            _ = renderer.c_api;
+        }
 
         // On Wasm we need to export our allocator convenience functions.
         if (builtin.target.cpu.arch.isWasm()) {

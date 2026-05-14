@@ -33,6 +33,13 @@ pub const Padding = size.Padding;
 pub const cursorStyle = cursor.style;
 pub const lib = @import("lib/main.zig");
 
+const options = @import("terminal_options");
+
+/// C ABI surface for the renderer module. Compiled only when c_abi is set
+/// (i.e., when building the C/WASM library). On native builds this resolves
+/// to `void` so no extra code is included.
+pub const c_api = if (options.c_abi) @import("renderer/c/main.zig") else void;
+
 /// The implementation to use for the renderer. This is comptime chosen
 /// so that every build has exactly one renderer implementation.
 pub const Renderer = switch (build_config.renderer) {

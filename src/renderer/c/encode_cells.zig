@@ -505,6 +505,24 @@ pub fn encodeCellsPhase1(ctx: *const FrameCtx, out: *EncodeOutput) i32 {
         }
     }
 
+    // Cursor cell flag — block cursor only; underline/bar cursors are
+    // drawn as separate quads by the cursor pipeline, not flagged here.
+    //
+    // Scrollback note: rowIterator(.{ .viewport = .{} }) already resolves
+    // via PageList.getTopLeft(.viewport) which returns viewport_pin.* when
+    // the user has scrolled back. The viewport_pin is updated by ghostty
+    // whenever the user scrolls, so the encoder naturally reads the correct
+    // scrolled-back rows — scrollback support is automatic (Case A).
+    const cursor_visible = (ctx.cursor_visible_blink & 1) != 0;
+    const cursor_blink_visible = (ctx.cursor_visible_blink & 2) != 0;
+    const cursor_is_block = ctx.cursor_style == 0;
+    if (cursor_visible and cursor_blink_visible and cursor_is_block) {
+        if (ctx.cursor_x < cols and ctx.cursor_y < rows) {
+            const ci: u32 = (ctx.cursor_y * cols + ctx.cursor_x) * cell_layout.CELL_U32S;
+            output[ci + 4] |= cell_layout.FLAG_IS_CURSOR_CELL;
+        }
+    }
+
     return 0;
 }
 
@@ -953,4 +971,59 @@ test "encodeCellsPhase1: kitty placeholder with no table match doesn't set flag"
     const flags = fixture.output_buf[4];
     try std.testing.expect((flags & cell_layout.FLAG_IS_KITTY_PLACEHOLDER) == 0);
     try std.testing.expectEqual(@as(u32, 0), out.used_kitty_image_count);
+}
+
+test "encodeCellsPhase1: block cursor sets FLAG_IS_CURSOR_CELL" {
+    var ht = try HostTestTerminal.init(80, 24);
+    defer ht.deinit();
+
+    var fixture: TestFixture = .{};
+    var ctx = fixture.baseCtx(ht.handle());
+    // Cursor at (5, 3), block-style, visible AND blink-visible.
+    ctx.cursor_x = 5;
+    ctx.cursor_y = 3;
+    ctx.cursor_style = 0; // block
+    ctx.cursor_visible_blink = 0b11;
+    var out: EncodeOutput = undefined;
+
+    _ = encodeCellsPhase1(&ctx, &out);
+
+    const ci = (3 * 80 + 5) * cell_layout.CELL_U32S;
+    try std.testing.expect((fixture.output_buf[ci + 4] & cell_layout.FLAG_IS_CURSOR_CELL) != 0);
+}
+
+test "encodeCellsPhase1: cursor not flagged when blink-hidden" {
+    var ht = try HostTestTerminal.init(80, 24);
+    defer ht.deinit();
+
+    var fixture: TestFixture = .{};
+    var ctx = fixture.baseCtx(ht.handle());
+    ctx.cursor_x = 5;
+    ctx.cursor_y = 3;
+    ctx.cursor_style = 0; // block
+    ctx.cursor_visible_blink = 0b01; // visible but blink_visible=false
+    var out: EncodeOutput = undefined;
+
+    _ = encodeCellsPhase1(&ctx, &out);
+
+    const ci = (3 * 80 + 5) * cell_layout.CELL_U32S;
+    try std.testing.expectEqual(@as(u32, 0), fixture.output_buf[ci + 4] & cell_layout.FLAG_IS_CURSOR_CELL);
+}
+
+test "encodeCellsPhase1: underline cursor doesn't set FLAG_IS_CURSOR_CELL" {
+    var ht = try HostTestTerminal.init(80, 24);
+    defer ht.deinit();
+
+    var fixture: TestFixture = .{};
+    var ctx = fixture.baseCtx(ht.handle());
+    ctx.cursor_x = 5;
+    ctx.cursor_y = 3;
+    ctx.cursor_style = 1; // underline
+    ctx.cursor_visible_blink = 0b11;
+    var out: EncodeOutput = undefined;
+
+    _ = encodeCellsPhase1(&ctx, &out);
+
+    const ci = (3 * 80 + 5) * cell_layout.CELL_U32S;
+    try std.testing.expectEqual(@as(u32, 0), fixture.output_buf[ci + 4] & cell_layout.FLAG_IS_CURSOR_CELL);
 }

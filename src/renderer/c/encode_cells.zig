@@ -176,12 +176,25 @@ pub fn encodeCellsPhase1(ctx: *const FrameCtx, out: *EncodeOutput) i32 {
     const grapheme_buf: [*]u8 = @ptrFromInt(ctx.grapheme_scratch_ptr);
     const needs_atlas_entries: [*]NeedsAtlasEntry = @ptrFromInt(ctx.needs_atlas_ptr);
 
-    // Walk active viewport rows top-to-bottom.
-    var row_it = screen.pages.rowIterator(
-        .right_down,
-        .{ .viewport = .{} },
-        null,
-    );
+    // Walk viewport rows top-to-bottom, honoring ctx.viewport_y.
+    //
+    // ghostty-web tracks the scroll position purely JS-side (a plain
+    // number in lib/terminal.ts) and never moves ghostty's internal
+    // PageList viewport pin. So `.{ .viewport = .{} }` always resolves
+    // to the active screen. To render scrolled-back history we take the
+    // active viewport's top-left pin and walk it UP `viewport_y` rows
+    // into the PageList scrollback. viewport_y == 0 leaves the start pin
+    // exactly at the active top-left, preserving prior behavior.
+    //
+    // Clamp: if viewport_y exceeds available history, `Pin.up` returns
+    // null; fall back to the topmost row of the whole screen so we
+    // render from the very top rather than crashing or wrapping.
+    const viewport_tl: terminal.Pin = screen.pages.getTopLeft(.viewport);
+    const start_pin: terminal.Pin = if (ctx.viewport_y == 0)
+        viewport_tl
+    else
+        viewport_tl.up(ctx.viewport_y) orelse screen.pages.getTopLeft(.screen);
+    var row_it = start_pin.rowIterator(.right_down, null);
     var y: u32 = 0;
     while (row_it.next()) |row_pin| : (y += 1) {
         if (y >= rows) break;
@@ -508,11 +521,11 @@ pub fn encodeCellsPhase1(ctx: *const FrameCtx, out: *EncodeOutput) i32 {
     // Cursor cell flag — block cursor only; underline/bar cursors are
     // drawn as separate quads by the cursor pipeline, not flagged here.
     //
-    // Scrollback note: rowIterator(.{ .viewport = .{} }) already resolves
-    // via PageList.getTopLeft(.viewport) which returns viewport_pin.* when
-    // the user has scrolled back. The viewport_pin is updated by ghostty
-    // whenever the user scrolls, so the encoder naturally reads the correct
-    // scrolled-back rows — scrollback support is automatic (Case A).
+    // ctx.cursor_{x,y} are viewport-relative coordinates supplied by JS
+    // for the active screen. When the user has scrolled back
+    // (viewport_y > 0) the cursor belongs to rows that are no longer in
+    // the rendered region, but the JS side only flags the cursor when
+    // viewport_y == 0, so no extra guard is needed here.
     const cursor_visible = (ctx.cursor_visible_blink & 1) != 0;
     const cursor_blink_visible = (ctx.cursor_visible_blink & 2) != 0;
     const cursor_is_block = ctx.cursor_style == 0;
@@ -584,13 +597,17 @@ const HostTestTerminal = struct {
     inner: *terminal.Terminal,
 
     fn init(cols: u16, rows: u16) !HostTestTerminal {
+        return initScrollback(cols, rows, 0);
+    }
+
+    fn initScrollback(cols: u16, rows: u16, max_scrollback: usize) !HostTestTerminal {
         // Use the C-ABI `new` to construct a wrapper around a fresh
         // Terminal — this mirrors exactly what the JS side does.
         var h: terminal_c.Terminal = null;
         const res = terminal_c.new(null, &h, .{
             .cols = cols,
             .rows = rows,
-            .max_scrollback = 0,
+            .max_scrollback = max_scrollback,
         });
         if (res != .success) return error.TerminalInitFailed;
         const inner = terminal_c.terminalPtr(h).?;
@@ -1008,6 +1025,125 @@ test "encodeCellsPhase1: cursor not flagged when blink-hidden" {
 
     const ci = (3 * 80 + 5) * cell_layout.CELL_U32S;
     try std.testing.expectEqual(@as(u32, 0), fixture.output_buf[ci + 4] & cell_layout.FLAG_IS_CURSOR_CELL);
+}
+
+/// Decode the single base codepoint encoded for the cell at
+/// (row, col) by scanning the NeedsAtlasEntry list produced by an
+/// encode. Returns null if no entry exists for that cell (empty cell).
+fn graphemeFirstCp(
+    out: *const EncodeOutput,
+    entries: []const NeedsAtlasEntry,
+    cols: u32,
+    row: u32,
+    col: u32,
+) ?u21 {
+    const want_offset: u32 = (row * cols + col) * cell_layout.CELL_U32S;
+    var k: u32 = 0;
+    while (k < out.needs_atlas_count) : (k += 1) {
+        const e = entries[k];
+        if (e.cell_offset != want_offset) continue;
+        const buf: [*]const u8 = @ptrFromInt(e.grapheme_utf8_ptr);
+        const view = std.unicode.Utf8View.initUnchecked(buf[0..e.grapheme_utf8_len]);
+        var it = view.iterator();
+        return it.nextCodepoint();
+    }
+    return null;
+}
+
+/// Write 20 distinct lines "L00".."L19" into the terminal. A CR/LF
+/// precedes each line except the first, so the last line ("L19")
+/// has NO trailing newline — leaving the active 5-row viewport at
+/// exactly L15..L19 and L00..L14 in scrollback history.
+fn writeScrollbackLines(ht: *HostTestTerminal) void {
+    var line_no: u32 = 0;
+    while (line_no < 20) : (line_no += 1) {
+        var buf: [8]u8 = undefined;
+        const s = if (line_no == 0)
+            std.fmt.bufPrint(&buf, "L{d:0>2}", .{line_no}) catch unreachable
+        else
+            std.fmt.bufPrint(&buf, "\r\nL{d:0>2}", .{line_no}) catch unreachable;
+        terminal_c.vt_write(ht.wrapper_handle, s.ptr, s.len);
+    }
+}
+
+test "encodeCellsPhase1: viewport_y selects historical scrollback rows" {
+    // 20 cols x 5 rows so 15 lines land in scrollback after writing 20.
+    var ht = try HostTestTerminal.initScrollback(20, 5, 1000);
+    defer ht.deinit();
+    writeScrollbackLines(&ht);
+
+    const cols: u32 = 20;
+    const rows: u32 = 5;
+
+    // --- viewport_y = 0: bottom rows visible (L15..L19) ---------------
+    {
+        var fixture: TestFixture = .{};
+        var ctx = fixture.baseCtx(ht.handle());
+        ctx.viewport_y = 0;
+        var out: EncodeOutput = undefined;
+        const rc = encodeCellsPhase1(&ctx, &out);
+        try std.testing.expectEqual(@as(i32, 0), rc);
+
+        // Row r should hold logical line L(15+r). Verify via the
+        // tens/ones digit at columns 1 and 2.
+        var r: u32 = 0;
+        while (r < rows) : (r += 1) {
+            const expected_line = 15 + r;
+            const c0 = graphemeFirstCp(&out, &fixture.needs_atlas, cols, r, 0).?;
+            const c1 = graphemeFirstCp(&out, &fixture.needs_atlas, cols, r, 1).?;
+            const c2 = graphemeFirstCp(&out, &fixture.needs_atlas, cols, r, 2).?;
+            try std.testing.expectEqual(@as(u21, 'L'), c0);
+            try std.testing.expectEqual(@as(u21, '0' + @as(u21, @intCast(expected_line / 10))), c1);
+            try std.testing.expectEqual(@as(u21, '0' + @as(u21, @intCast(expected_line % 10))), c2);
+        }
+    }
+
+    // --- viewport_y = 10: scrolled 10 rows up (L05..L09) --------------
+    {
+        var fixture: TestFixture = .{};
+        var ctx = fixture.baseCtx(ht.handle());
+        ctx.viewport_y = 10;
+        var out: EncodeOutput = undefined;
+        const rc = encodeCellsPhase1(&ctx, &out);
+        try std.testing.expectEqual(@as(i32, 0), rc);
+
+        // Top row is 10 rows above the active viewport top (L15), so
+        // row r should hold logical line L(5+r): L05..L09.
+        var r: u32 = 0;
+        while (r < rows) : (r += 1) {
+            const expected_line = 5 + r;
+            const c0 = graphemeFirstCp(&out, &fixture.needs_atlas, cols, r, 0).?;
+            const c1 = graphemeFirstCp(&out, &fixture.needs_atlas, cols, r, 1).?;
+            const c2 = graphemeFirstCp(&out, &fixture.needs_atlas, cols, r, 2).?;
+            try std.testing.expectEqual(@as(u21, 'L'), c0);
+            try std.testing.expectEqual(@as(u21, '0' + @as(u21, @intCast(expected_line / 10))), c1);
+            try std.testing.expectEqual(@as(u21, '0' + @as(u21, @intCast(expected_line % 10))), c2);
+        }
+    }
+}
+
+test "encodeCellsPhase1: viewport_y beyond scrollback clamps to topmost row" {
+    var ht = try HostTestTerminal.initScrollback(20, 5, 1000);
+    defer ht.deinit();
+    writeScrollbackLines(&ht);
+
+    const cols: u32 = 20;
+
+    // viewport_y far beyond available history. Clamp: the top rendered
+    // row should be the topmost scrollback row (L00).
+    var fixture: TestFixture = .{};
+    var ctx = fixture.baseCtx(ht.handle());
+    ctx.viewport_y = 9999;
+    var out: EncodeOutput = undefined;
+    const rc = encodeCellsPhase1(&ctx, &out);
+    try std.testing.expectEqual(@as(i32, 0), rc);
+
+    const c0 = graphemeFirstCp(&out, &fixture.needs_atlas, cols, 0, 0).?;
+    const c1 = graphemeFirstCp(&out, &fixture.needs_atlas, cols, 0, 1).?;
+    const c2 = graphemeFirstCp(&out, &fixture.needs_atlas, cols, 0, 2).?;
+    try std.testing.expectEqual(@as(u21, 'L'), c0);
+    try std.testing.expectEqual(@as(u21, '0'), c1);
+    try std.testing.expectEqual(@as(u21, '0'), c2);
 }
 
 test "encodeCellsPhase1: underline cursor doesn't set FLAG_IS_CURSOR_CELL" {

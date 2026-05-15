@@ -64,8 +64,11 @@ pub const FrameCtx = extern struct {
     grapheme_scratch_len: u32,
 
     /// Input: JS-prepared imageId -> (idx in used_kitty_image_ids) map,
-    /// for kitty placeholder cells. Format: pairs of (imageId, idx) u32,
-    /// terminated by imageId==0. Read but not written by WASM.
+    /// for kitty placeholder cells. Each entry is four u32 fields:
+    /// (image_id, idx, grid_cols, grid_rows). Terminated by an entry
+    /// with image_id == 0. Read but not written by WASM. See
+    /// `KittyImageTableEntry` in encode_cells.zig for the canonical
+    /// layout.
     kitty_image_table_ptr: usize,
     kitty_image_table_len: u32,
 };
